@@ -27,7 +27,7 @@ from sklearn.svm import SVC
 
 from router.features import embed
 
-MODEL_PATH = Path(__file__).parent / "logreg_router.joblib"
+MODEL_PATH = Path(__file__).parent / "router_model.joblib"
 
 
 def make_estimator():

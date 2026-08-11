@@ -533,20 +533,115 @@ the new recommended point.
 
 ---
 
+## Phase 9 — LLM-judge manual validation (Section 9)
+
+**What:** Built `eval/validate_judge.py`. Sampled 35 (query, tier) pairs that
+were actually scored by the judge (not exact-match), re-ran the judge on each
+to also capture its written justification (not otherwise persisted), and
+exported to `data/results/judge_validation_sample.csv` with a blank
+`human_verdict` column. The user independently read each
+query/reference/candidate answer and filled in their own `correct`/
+`incorrect` call, without being told to look at the judge's verdict first.
+
+**Side finding while building the sample:** re-running the judge on these 35
+items produced a different verdict than what was originally recorded for 3
+of them (q0141, q0120, q0172-small), even at temperature=0. Likely
+floating-point/batching non-determinism in Ollama's inference rather than
+true randomness. Small (3/35 ≈ 8.6%) but real — logged as a limitation of
+the correctness labels generally, not just this validation sample.
+
+**Result: 97.1% agreement (34/35)** between the judge and independent human
+review — a strong, defensible number for Section 9's requirement.
+
+**The one disagreement (q0141, "significance of the Magna Carta"):** the
+judge said `correct`; the human reviewer said `incorrect`. On inspection,
+the human call holds up — the candidate answer contains two real errors it
+labels "King John **I**" (there was no King John II; he's just "King John")
+and claims the Magna Carta required royal taxation to have "the consent of
+**Parliament**," which is anachronistic since Parliament didn't yet exist as
+an institution in 1215. The judge's justification only checked whether the
+answer's *themes* matched the reference (limiting royal power, individual
+rights) without verifying these specific factual claims — a real blind spot
+that survived the stricter step-by-step verification prompt. Notably, this
+is the same query flagged above for verdict non-determinism, so it was
+already a borderline, error-prone case rather than a random outlier.
+
+**Takeaway for the write-up:** the judge is reliable enough to trust in
+aggregate (97.1% agreement, and the one miss is a subtle factual-accuracy
+gap rather than the kind of gross logical failure caught earlier in the
+pilot with the coin-puzzle case), but it still has a demonstrated blind spot
+for domain-specific factual precision when the overall thematic shape of an
+answer matches the reference. Worth disclosing both the number and this
+specific limitation, not just the headline percentage.
+
+---
+
+## Phase 10 — Write-up
+
+**What:** Wrote `results/writeup.md` — the polished, interview-facing
+methodology + results document (distinct from this log, which is a
+chronological working journal). Pulled every figure directly from the
+current `data/results/*.json`/`.csv` files rather than from memory, to avoid
+carrying forward any stale numbers from earlier iterations (e.g. the routing
+label counts shifted slightly, 149→150 small, after the runaway-generation
+patch in Phase 7).
+
+Explicitly includes everything Section 12 requires: methodology, the
+baselines comparison table, the LLM-judge validation agreement rate (97.1%,
+with the one disagreement's root cause explained rather than just the
+number), the chosen threshold (0.65) with its written justification, and
+disclosed simulated-cost and same-hardware-latency methodology sections —
+including the fact that the full run's latency numbers come from Kaggle's
+P100, not the local RTX 1650 the pilot ran on, which is a distinction the
+original project brief's latency disclosure didn't anticipate needing since
+it assumed everything would stay local.
+
+Also explicitly resolved the "two different unlabeled router numbers" gap
+noted below: the write-up's baseline table is labeled as the router's
+*default, untuned* threshold, with the recommended 0.65 operating point
+presented separately in its own section with justification, so a reader
+can't confuse the two.
+
+---
+
+## Phase 11 — Demo wrapper and README
+
+**What:** Built `demo/app.py`, a FastAPI wrapper exposing `POST /route`:
+embeds the query, gets `P(large)` from the trained SVM router, applies the
+recommended threshold (now a proper module-level constant,
+`pipeline.threshold_sweep.RECOMMENDED_THRESHOLD = 0.65`, imported rather
+than hardcoded a second time), calls the chosen Ollama tier, and returns
+tier used / probability / latency / simulated cost / answer — the full
+"query in -> tier used, latency, answer out" trail Section 12 asks for.
+
+**Small cleanups made along the way:** renamed the saved router artifact
+from `router/logreg_router.joblib` to `router/router_model.joblib` (the old
+name was left over from before the SVM switch and was actively misleading);
+retrained once to regenerate it at the new path and deleted the stale file.
+
+**Tested end-to-end, not just imported:** started the server and posted two
+real queries against the live pipeline (actual Ollama calls, not mocked).
+An easy query ("capital of France") correctly routed to small (p=0.09,
+6.3s). A hard query (pendulum period derivation) correctly routed to large
+(p=0.85, 89.4s) and produced a genuinely correct derivation matching the
+reference answer. Both the routing decision and the underlying model
+behavior check out.
+
+Also wrote `README.md` — project overview, repo structure, setup, full
+reproduction commands for every phase (verified each one matches its
+script's actual CLI interface, not just written from memory), demo
+instructions, and a key-results summary table.
+
+**This closes out Section 12's deliverables except the two that are
+explicitly the user's task, not something to automate:**
+
+---
+
 ## Still open / not yet done
 
 - Manual review of ~20-25% of the dataset for correctness/difficulty
   (Section 5) — not done.
 - Moving the reviewed subset to `data/curated/` — not done.
-- LLM-judge manual validation, 30-40 examples (Section 9) — not done. This
-  matters more than usual here, since we already found and fixed one real
-  judge-leniency failure during the pilot; the formal validation pass hasn't
-  happened yet.
-- `pipeline/baselines.py` still reports the SVM router at its untuned
-  default (0.5) threshold, not the recommended 0.65 — same "two different
-  unlabeled numbers for the router" gap as before, now against updated
-  numbers. Should be labeled clearly in the write-up.
-- Write-up (`results/writeup.md`), demo wrapper, README — not done.
 
 ## Done since the above sections were written
 

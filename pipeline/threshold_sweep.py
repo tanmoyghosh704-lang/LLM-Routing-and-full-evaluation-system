@@ -26,6 +26,11 @@ from router.rule_based import route as rule_based_route
 
 THRESHOLDS = [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85]
 
+# See results/writeup.md Section 3.5 for the full justification: this is the
+# largest threshold at which the SVM router's accuracy still matches or
+# beats the rule-based router's flat accuracy.
+RECOMMENDED_THRESHOLD = 0.65
+
 # Simulated per-million-token USD pricing, modeled on public cheap-tier vs.
 # premium-tier commercial API pricing (e.g. a GPT-4o-mini/Claude Haiku class
 # of pricing for the small tier, GPT-4o/Claude Sonnet class for the large
@@ -215,11 +220,5 @@ if __name__ == "__main__":
     make_metric_plot(sweep_df, baseline_a, baseline_b, rule_based, "avg_cost_usd", "Avg. simulated cost per query (USD)", "Simulated cost vs. routing threshold", "cost_vs_threshold.png")
     make_metric_plot(sweep_df, baseline_a, baseline_b, rule_based, "avg_latency_seconds", "Avg. latency per query (s)", "Latency vs. routing threshold", "latency_vs_threshold.png")
 
-    # Recommended operating point: see results/project_log.md for the full
-    # justification. t=0.65 is the largest threshold (most cost/latency
-    # savings) at which the SVM router's accuracy still matches or beats the
-    # rule-based router's flat 82.1% -- past this point accuracy drops below
-    # that baseline and the curve's slope also visibly steepens.
-    RECOMMENDED_THRESHOLD = 0.65
     make_accuracy_vs_cost_savings_plot(sweep_df, baseline_a, baseline_b, rule_based, RECOMMENDED_THRESHOLD)
     print(f"Wrote plots to {PLOTS_DIR}/")
