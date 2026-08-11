@@ -1,0 +1,20 @@
+{
+  "A_always_small": {
+    "accuracy": 0.44776119402985076,
+    "avg_latency_seconds": 2.583317263372853,
+    "avg_cost_usd": 0.0002112783582089552,
+    "pct_routed_small": 1.0
+  },
+  "B_always_large": {
+    "accuracy": 1.0,
+    "avg_latency_seconds": 7.982078366089557,
+    "avg_cost_usd": 0.0034239925373134327,
+    "pct_routed_small": 0.0
+  },
+  "rule_based_router": {
+    "accuracy": 0.8208955223880597,
+    "avg_latency_seconds": 6.58493728285075,
+    "avg_cost_usd": 0.002514946268656716,
+    "pct_routed_small": 0.4925373134328358
+  }
+}

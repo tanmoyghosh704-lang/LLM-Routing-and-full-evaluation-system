@@ -1,0 +1,26 @@
+{
+  "A_always_small": {
+    "n": 67,
+    "accuracy": 0.44776119402985076,
+    "avg_latency_seconds": 2.583317263372853,
+    "pct_routed_small": 1.0
+  },
+  "B_always_large": {
+    "n": 67,
+    "accuracy": 1.0,
+    "avg_latency_seconds": 7.982078366089557,
+    "pct_routed_small": 0.0
+  },
+  "C_rule_based_router": {
+    "n": 67,
+    "accuracy": 0.8208955223880597,
+    "avg_latency_seconds": 6.58493728285075,
+    "pct_routed_small": 0.4925373134328358
+  },
+  "C_embeddings_svm_router": {
+    "n": 67,
+    "accuracy": 0.9104477611940298,
+    "avg_latency_seconds": 7.097305302388064,
+    "pct_routed_small": 0.3880597014925373
+  }
+}

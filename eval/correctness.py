@@ -28,6 +28,14 @@ def _normalize(text: str) -> str:
 
 def try_exact_match(model_answer: str, reference_answer: str) -> bool | None:
     """Return True/False if confidently gradable by short-answer matching, else None."""
+    # Guard on the *full* reference length, not just the extracted core: a
+    # long multi-sentence procedural reference (e.g. a puzzle solution) can
+    # have a short, coincidentally-numeric fragment before its first comma,
+    # which would otherwise let a trivial number match (e.g. "3" from
+    # "divide into groups of 3") falsely credit an unrelated or wrong answer.
+    if len(_normalize(reference_answer).split()) > 20:
+        return None
+
     core_norm = _normalize(_core_answer(reference_answer))
     words = core_norm.split()
     if not words or len(words) > 8:
@@ -35,10 +43,17 @@ def try_exact_match(model_answer: str, reference_answer: str) -> bool | None:
 
     model_norm = _normalize(model_answer)
 
-    core_nums = _NUM_RE.findall(core_norm)
-    if core_nums and len(words) <= 3:
-        if core_nums[0] in _NUM_RE.findall(model_norm):
-            return True
-
+    # Try a literal phrase match first, but don't rely on it alone: model
+    # answers often reformat numbers/units (e.g. LaTeX "\text{cm}^2" vs plain
+    # "cm^2"), breaking a contiguous phrase match even when the underlying
+    # answer is correct. Numeric answers get a fallback check regardless of
+    # how many words the extracted core phrase has.
     pattern = r"\b" + re.escape(core_norm) + r"\b"
-    return bool(re.search(pattern, model_norm))
+    if re.search(pattern, model_norm):
+        return True
+
+    core_nums = _NUM_RE.findall(core_norm)
+    if core_nums and core_nums[0] in _NUM_RE.findall(model_norm):
+        return True
+
+    return False
