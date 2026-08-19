@@ -1,0 +1,338 @@
+================================================================================
+PROJECT ROADMAP & RESOURCE BREAKDOWN: COST-AWARE LLM ROUTING & EVALUATION
+================================================================================
+
+PROJECT OVERVIEW:
+Building a data-driven router that predicts, per incoming query, whether a
+small/cheap/fast LLM is sufficient or whether a large/expensive/slow LLM is
+required -- instead of naively always calling the expensive model. Ground
+truth is derived empirically (both tiers actually answer every query, then
+are scored for correctness), a router is trained on that ground truth using
+sentence embeddings, and the resulting accuracy/cost/latency trade-off curve
+is swept and characterized well enough to justify one specific operating
+point, not picked by feel.
+
+================================================================================
+PHASE 1: ACCOUNTS, COMPUTE & ENVIRONMENT SETUP
+================================================================================
+
+1. ACCOUNTS & ACCESS TO SOURCE:
+   - No paid API account is required -- all three LLM tiers run locally via
+     Ollama (free, no token limits, no rate-limit risk).
+   - Kaggle Account (Optional but Recommended for the full batch run):
+     * Free GPU quota (~30 hrs/week), used only for the heavy batch-inference
+       phase if local hardware proves too slow (see Phase 6).
+
+2. COMPUTE ENVIRONMENT:
+   - Local: any machine that can run Ollama. A small GPU (e.g. 4 GB VRAM) is
+     enough for the small tier; the large tier may partially spill to
+     CPU/RAM on modest hardware -- this is expected and even useful, since it
+     is what creates the latency gap the whole project studies.
+   - Kaggle: enable GPU (P100/T4) + Internet in the notebook's Settings panel
+     before running anything.
+
+3. SOFTWARE & DEPENDENCIES TO INSTALL:
+   - Ollama runtime:
+     Download from https://ollama.com/download and confirm the server runs:
+     ollama serve
+
+   - Python virtual environment + dependencies (requirements.txt):
+     python -m venv .venv
+     .venv/Scripts/activate          (Windows; `source .venv/bin/activate` elsewhere)
+     pip install requests sentence-transformers scikit-learn pandas numpy \
+                 matplotlib fastapi uvicorn
+
+================================================================================
+PHASE 2: MODEL ACQUISITION (OLLAMA)
+================================================================================
+
+1. WHAT TO PULL:
+   Three models, each with a fixed, non-overlapping role -- the judge is
+   never a routing candidate, and both routing tiers stay fixed once chosen
+   so the comparison between them stays meaningful.
+
+   - Tier 1 (small / cheap / fast routing candidate):
+     ollama pull qwen2.5:0.5b-instruct-q4_0
+
+   - Tier 2 (large / expensive / slow routing candidate):
+     ollama pull qwen2.5:7b-instruct-q4_0
+
+   - Judge (correctness grading only, never routed to):
+     ollama pull qwen2.5:14b
+
+2. IMPORTANT DESIGN NOTE -- TIER 1 MODEL SIZE:
+   Tier 1 was originally specified as qwen2.5:1.5b-instruct-q4_0. An early
+   pilot run showed this model was surprisingly capable -- the resulting
+   small/large split was nearly degenerate (87% of queries resolved to
+   "small," including most hard-tier questions), leaving a router with
+   almost nothing to learn. Tier 1 was moved down to 0.5B, staying inside
+   the same model family so instruction-tuning style stays constant and
+   parameter count is the one variable driving the capability gap. Always
+   verify your "small" tier is actually weak enough to make routing matter
+   before building anything on top of it.
+
+3. IMPORTANT DESIGN NOTE -- WHY A SEPARATE JUDGE MODEL:
+   Using Tier 2 to both answer queries AND grade every tier's answers risks
+   the judge being lenient toward its own reasoning style. A dedicated,
+   larger, independent judge model avoids this -- and this was not a
+   hypothetical concern (see Phase 9).
+
+================================================================================
+PHASE 3: DATASET GENERATION
+================================================================================
+
+1. COMPOSITION:
+   350 hand-authored queries (not template-generated), spanning:
+   - 3 difficulty tiers: 120 easy / 115 medium / 115 hard
+   - 16 categories: general knowledge, geography, history, physics,
+     chemistry, biology, mathematics, programming, logic puzzles, grammar,
+     business/finance, literature, everyday reasoning, philosophy/ethics,
+     long-context analysis, domain-specific expert questions (law,
+     engineering, immunology, etc.)
+
+2. RECORD SCHEMA (data/raw/queries_raw.jsonl):
+   {
+     "query_id": "q0001",
+     "query_text": "What is the chemical symbol for gold?",
+     "category": "general_knowledge",
+     "difficulty_label": "easy",
+     "reference_answer": "Au",
+     "small_model_answer": null,
+     "large_model_answer": null,
+     "small_model_correct": null,
+     "large_model_correct": null,
+     "routing_label": null
+   }
+
+   The last five fields start empty and are filled in during Phase 6 (batch
+   inference) and Phase 5's scoring logic -- the dataset file is the same
+   file end to end, progressively enriched rather than copied between
+   stages.
+
+3. QUALITY CONTROL WHILE AUTHORING:
+   - Verify "hard" queries are actually hard (plausible for the small model
+     to fail), not just longer versions of medium queries.
+   - Check for duplicate query text across the full set.
+   - For open-ended queries, write reference answers with enough reasoning
+     to support later LLM-judge grading, not just a bare answer string.
+
+================================================================================
+PHASE 4: ROUTER ARCHITECTURE
+================================================================================
+
+1. TWO VARIANTS (build both, compare them honestly):
+   - Rule-based router (router/rule_based.py): a keyword + length heuristic
+     scoring function. Quick sanity-check baseline, not the real system.
+   - Embeddings + classifier router (router/classifier.py): the real system.
+
+2. KEY CONCEPT -- PROBABILITY OUTPUT, NOT A HARD DECISION:
+   The router outputs P(large_model_required) rather than a binary choice.
+   This is what makes a threshold sweep (Phase 8) possible at all -- one
+   trained model can be tuned to different operating points after the fact,
+   instead of needing to be retrained for every accuracy/cost preference.
+
+3. EMBEDDING EXTRACTION (router/features.py):
+   from sentence_transformers import SentenceTransformer
+   model = SentenceTransformer("all-MiniLM-L6-v2", device="cpu")
+   vectors = model.encode(query_texts)     # (n, 384) float array
+
+4. CLASSIFIER TRAINING (router/classifier.py):
+   from sklearn.svm import SVC
+   clf = SVC(kernel="rbf", probability=True, class_weight="balanced")
+   clf.fit(X_train_embeddings, y_train_routing_label)
+   p_large = clf.predict_proba(X_query_embedding)[:, 1]
+
+   (SVC with an RBF kernel was chosen empirically over plain
+   LogisticRegression -- see Phase 7.)
+
+================================================================================
+PHASE 5: CORRECTNESS SCORING METHODOLOGY
+================================================================================
+
+1. TWO SCORING PATHS (eval/correctness.py, eval/llm_judge.py):
+   - Exact-match: for reference answers with a short, objective core fact
+     (a number, name, or short phrase before any explanatory clause).
+     Reference answers longer than ~20 words are NOT attempted this way --
+     they defer to the judge, to avoid a spurious match on a coincidental
+     short fragment inside a long procedural answer.
+   - LLM-as-judge: for open-ended queries, using the dedicated judge model
+     (Phase 2) with a prompt that requires step-by-step verification of
+     each claim/calculation before ruling on correctness, not a loose
+     "does this look roughly right" check.
+
+2. ROUTING LABEL DERIVATION (the ground truth the router trains on):
+   small_correct                       -> routing_label = "small"
+   small_incorrect AND large_correct   -> routing_label = "large"
+   small_incorrect AND large_incorrect -> excluded from training entirely
+
+   Do not assume the large model is always correct -- ground every label in
+   actually-measured correctness, and explicitly flag the rare case where
+   the small model is right and the large model is wrong (worth reporting,
+   not discarding as noise).
+
+================================================================================
+PHASE 6: BATCH INFERENCE PIPELINE & FULL RUN
+================================================================================
+
+1. PORTABLE RUNNER (pipeline/batch_runner.py):
+   Identical code path for local execution and a Kaggle notebook cell --
+   only the Ollama install/startup steps differ by environment.
+
+   python -m pipeline.batch_runner --pilot --output data/results/pilot_run.csv
+   python -m pipeline.batch_runner --output data/results/full_run.csv
+
+2. DECISION RULE -- LOCAL VS. KAGGLE:
+   Run the 30-query pilot locally first. If both tiers respond in a
+   reasonable time without straining the machine, stay local for the full
+   run too. Only move the full run to Kaggle if the pilot shows it would
+   take unreasonably long locally (in this project: an accurate,
+   independent judge model made the pipeline slow enough that the full
+   350-query run was reasonably estimated at 6-7 hours locally, which
+   justified moving to Kaggle's free GPU).
+
+3. KAGGLE-SPECIFIC GOTCHA:
+   The Ollama installer needs `zstd` to extract its archive, which is not in
+   Kaggle's base image -- install it first or the install silently fails
+   and the server never starts:
+   !apt-get update -qq && apt-get install -y -qq zstd
+   !curl -fsSL https://ollama.com/install.sh | sh
+
+4. IMPORTANT BUG TO GUARD AGAINST -- UNBOUNDED GENERATION:
+   Small instruction-tuned models can occasionally never emit a stop token
+   and ramble until hitting the model's context limit (observed: the 0.5B
+   tier generating 40,960-token, ~230 KB responses on a handful of queries,
+   massively distorting latency/cost measurements for those rows). Always
+   cap generation length on every tier-answer call:
+   generate(prompt, tier="small", num_predict=1024)
+
+================================================================================
+PHASE 7: ROUTER TRAINING & MODEL SELECTION
+================================================================================
+
+1. TRAIN/TEST SPLIT:
+   80/20 stratified split by routing_label, held fixed (same random_state)
+   across every downstream comparison so baselines, the router, and the
+   threshold sweep are all scored on the identical held-out rows.
+
+2. CLASSIFIER COMPARISON (router/model_comparison.py):
+   Six candidates compared on identical data, hyperparameters chosen via
+   5-fold cross-validation on the training set only:
+   - LogisticRegression (default, and CV-tuned with class_weight="balanced")
+   - RandomForestClassifier
+   - GradientBoostingClassifier
+   - SVC(kernel="rbf")
+   - MLPClassifier (small neural net)
+
+   python -m router.model_comparison
+
+3. SELECTION OUTCOME:
+   SVM (RBF) matched or beat LogisticRegression on accuracy, latency, AND
+   cost simultaneously, so it replaced LogisticRegression as the default
+   router. A higher-capacity model (the MLP) underperformed -- consistent
+   with the overfitting risk of a complex model trained on only ~265
+   examples. Router inference itself (embed + classify) is milliseconds
+   regardless of which algorithm is used; a better classifier only raises
+   accuracy at a given routing rate, it does not make routing itself faster.
+
+================================================================================
+PHASE 8: BASELINES, SIMULATED COST & THRESHOLD SWEEP
+================================================================================
+
+1. THREE COMPARISON SYSTEMS (pipeline/baselines.py):
+   - Baseline A: always use the small tier.
+   - Baseline B: always use the large tier.
+   - System C: the router (rule-based, and embeddings+SVM), evaluated both
+     ways for comparison.
+
+   python -m pipeline.baselines
+
+2. SIMULATED COST METHODOLOGY (disclose explicitly, do not imply real spend):
+   Ollama is free and local, so "cost" is simulated by mapping each tier's
+   actual recorded token counts onto published per-token pricing for a
+   comparably-positioned commercial API tier:
+
+   Small tier: $0.15 / 1M input tokens,  $0.60 / 1M output tokens
+   Large tier: $2.50 / 1M input tokens, $10.00 / 1M output tokens
+
+3. THRESHOLD SWEEP (pipeline/threshold_sweep.py):
+   Sweep the router's P(large_model_required) output across
+   [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85], recording accuracy,
+   % routed to small, average latency, and average simulated cost at each
+   threshold. Produces four plots: accuracy/cost/latency vs. threshold, and
+   a combined accuracy-vs-cost-savings trade-off curve.
+
+   python -m pipeline.threshold_sweep
+
+4. CHOOSING AN OPERATING POINT -- DO NOT PICK BY EYEBALLING THE CURVE ALONE:
+   Selection rule used: the largest threshold (maximizing savings) at which
+   the router's accuracy still matches or beats the rule-based baseline's
+   flat accuracy. Result: threshold = 0.65 -> 82.1% accuracy (equal to the
+   rule-based router) while cutting latency 22.4% and cost 34.1% versus
+   always using the large model -- genuine dominance over the simple
+   heuristic at this point, not just a different trade-off.
+
+================================================================================
+PHASE 9: LLM-JUDGE VALIDATION
+================================================================================
+
+1. PURPOSE:
+   An automated judge grading correctness is itself an unverified component
+   until checked against independent human judgment -- do not skip this
+   step or treat judge output as ground truth without it.
+
+2. SAMPLE, REVIEW, SCORE (eval/validate_judge.py):
+   python -m eval.validate_judge sample
+   # ... fill in the human_verdict column by hand, WITHOUT anchoring on the
+   #     judge's own verdict/justification shown alongside each row ...
+   python -m eval.validate_judge score
+
+3. RESULT:
+   35 judge-scored (query, tier) pairs reviewed independently by hand:
+   97.1% agreement (34/35). The one disagreement was a real, reportable
+   blind spot -- the judge verified the candidate answer's overall thematic
+   shape against the reference rather than every granular factual claim,
+   and missed a specific factual error as a result. A separate check also
+   found that re-running the judge on the same inputs at temperature=0
+   changed the verdict for 3 of the 35 (8.6%) -- disclose this as a source
+   of label noise rather than presenting correctness scores as exact.
+
+================================================================================
+PHASE 10: WRITE-UP, DEMO & DEPLOYMENT
+================================================================================
+
+1. RESULTS DOCUMENTATION:
+   - results/writeup.md: methodology, results tables, disclosed
+     limitations, chosen operating point with justification.
+   - results/project_log.md: chronological build/debugging journal --
+     what broke, how it was diagnosed, how it was fixed, in order.
+
+2. LIVE DEMO (demo/app.py, FastAPI):
+   uvicorn demo.app:app --reload
+
+   curl -X POST http://127.0.0.1:8000/route \
+        -H "Content-Type: application/json" \
+        -d '{"query": "What is the capital of France?"}'
+
+   Returns tier used, the router's P(large), latency, simulated cost, and
+   the actual answer -- the full "query in -> tier used, latency, answer
+   out" trail.
+
+3. README.md:
+   Project overview, repo structure, setup, reproduction commands for every
+   phase above, demo instructions, key-results summary table.
+
+================================================================================
+SUMMARY CHECKLIST
+================================================================================
+
+Phase 1: Setup            | Ollama, Python venv         | Install deps, `ollama serve`
+Phase 2: Model Acquisition | 3 Ollama model roles        | Pull 0.5b / 7b / 14b (judge)
+Phase 3: Dataset           | 350 queries, 16 categories  | Build queries_raw.jsonl
+Phase 4: Router Design     | 2 variants, prob. output    | rule_based.py + classifier.py
+Phase 5: Correctness       | Exact-match + LLM-judge     | Derive routing_label
+Phase 6: Batch Run         | Pilot -> local or Kaggle    | Produce full_run.csv
+Phase 7: Router Training   | 6-model CV comparison       | Select SVM (RBF) router
+Phase 8: Sweep & Cost      | Simulated pricing tiers     | Pick threshold = 0.65
+Phase 9: Judge Validation  | 35 human-reviewed samples   | Confirm 97.1% agreement
+Phase 10: Deliverables     | write-up, demo, README      | Ship reproducible results
+================================================================================
